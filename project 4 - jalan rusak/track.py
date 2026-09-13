@@ -3,14 +3,12 @@
 import cv2
 from ultralytics import YOLO
 
-import cv2
-from ultralytics import YOLO
 from pathlib import Path
 
 base_dir = Path(__file__).parent
 
 # 2. Gabungkan path untuk model dan video
-MODEL_PATH = base_dir / "models" / "best.pt"
+MODEL_PATH = base_dir / "models" / "best_models.pt"
 
 VIDEO_PATH = base_dir / "videos" / "gate1.mp4"
 

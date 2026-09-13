@@ -6,16 +6,21 @@ import time
 base_dir = Path(__file__).parent
 
 # 2. Gabungkan path untuk model dan video
-MODEL_PATH = base_dir / "models" / "best.pt"
+MODEL_PATH = base_dir / "models" / "best_models.pt"
 
-VIDEO_PATH = base_dir / "videos" / "gate1.mp4"
+VIDEO_PATH = base_dir / "videos" / "depan_kos.mp4"
 
-OUTPUT_PATH = base_dir / "output/road_damage_tracked.mp4"
+OUTPUT_PATH = base_dir / "output" / "depan_kos.mp4"
 
 
 CLASS_NAMES = {
     0: "Pothole",
     1: "Crack",
+}
+
+CLASS_COLORS = {
+    0: (0, 0, 255),    
+    1: (0, 210, 255)
 }
 
 
@@ -98,29 +103,45 @@ while True:
                 f"Class {cls}"
             )
 
-            label = (
-                f"{class_name}"
-                f"ID:{track_id}"
-                f"{conf:.2f}"
-            )
+            label = f"{class_name} #{track_id} {conf*100:.0f}%"
+
+            # ambil warna sesuai class
+            color = CLASS_COLORS.get(cls, (230, 216, 173))
 
             # bbox
             cv2.rectangle(
                 frame,
                 (x1, y1),
                 (x2, y2),
-                (255,0,0),
+                color,
                 2
+            )
+
+            # ukuran teks buat bikin background pas
+            (text_w, text_h), baseline = cv2.getTextSize(
+                label,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                2
+            )
+
+            # background solid di belakang label
+            cv2.rectangle(
+                frame,
+                (x1, max(y1 - 10, 20) - text_h - baseline - 4),
+                (x1 + text_w + 6, max(y1 - 10, 20) + baseline - 2),
+                color,
+                -1
             )
 
             # label
             cv2.putText(
                 frame,
                 label,
-                (x1, max(y1 - 10, 20)),
+                (x1, max(y1 - 10, 20) - 4),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (255, 0, 0),
+                (255, 255, 255),
                 2
             )
 
@@ -134,7 +155,7 @@ while True:
         (20,40),
         cv2.FONT_HERSHEY_COMPLEX,
         0.9,
-        (255,0,0),
+        CLASS_COLORS[0],
         2
     )
 
@@ -144,7 +165,7 @@ while True:
         (20,80),
         cv2.FONT_HERSHEY_COMPLEX,
         0.9,
-        (255,0,0),
+        CLASS_COLORS[1],
         2
     )
 
