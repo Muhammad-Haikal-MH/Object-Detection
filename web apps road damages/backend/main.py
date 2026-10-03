@@ -5,18 +5,22 @@ Supports Bounding Box and Dual Segmentation Models.
 
 import base64
 import os
+import shutil
 import subprocess
 import tempfile
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
+import torch
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
@@ -92,23 +96,14 @@ BBOX_CLASS_NAMES = {
 
 CONF_THRESHOLD = 0.3
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 _model_bbox = None
 _model_seg_pothole = None
 _model_seg_crack = None
 _model_loaded = False
 
-@app.on_event("startup")
-async def startup_event():
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global _model_bbox, _model_seg_pothole, _model_seg_crack, _model_loaded
     try:
         if MODEL_BBOX_PATH.exists():
@@ -117,9 +112,6 @@ async def startup_event():
             _model_seg_pothole = YOLO(str(MODEL_SEG_POTHOLE_PATH))
         if MODEL_SEG_CRACK_PATH.exists():
             _model_seg_crack = YOLO(str(MODEL_SEG_CRACK_PATH))
-            # The crack model was trained with task='semantic', but ultralytics 8.3+
-            # does not support predict for 'semantic'. Force it to 'segment' which
-            # uses the same architecture and allows predict to work correctly.
             if _model_seg_crack.task == "semantic":
                 _model_seg_crack.task = "segment"
                 if hasattr(_model_seg_crack, "model") and hasattr(_model_seg_crack.model, "task"):
@@ -129,16 +121,31 @@ async def startup_event():
         print("[startup] Models loaded successfully.")
     except Exception as exc:
         print(f"[startup] Failed to load models: {exc}")
+    yield
+
+
+app = FastAPI(title="Road Damage Detection API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def _get_bbox_model() -> YOLO:
     if not _model_loaded or _model_bbox is None:
         raise HTTPException(status_code=503, detail="BBox model not available.")
     return _model_bbox
 
+
 def _get_seg_models():
     if not _model_loaded or _model_seg_pothole is None or _model_seg_crack is None:
         raise HTTPException(status_code=503, detail="Segmentation models not available.")
     return _model_seg_pothole, _model_seg_crack
+
 
 async def _read_and_validate_size(file: UploadFile) -> bytes:
     data = await file.read()
@@ -146,13 +153,16 @@ async def _read_and_validate_size(file: UploadFile) -> bytes:
         raise HTTPException(status_code=413, detail="File too large.")
     return data
 
+
 def _validate_image_ext(filename: str):
     if Path(filename).suffix.lower() not in ALLOWED_IMAGE_EXT:
         raise HTTPException(status_code=415, detail="Unsupported image format.")
 
+
 def _validate_video_ext(filename: str):
     if Path(filename).suffix.lower() not in ALLOWED_VIDEO_EXT:
         raise HTTPException(status_code=415, detail="Unsupported video format.")
+
 
 def _draw_box_with_label(frame, x1, y1, x2, y2, label, color):
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -170,19 +180,17 @@ def _draw_box_with_label(frame, x1, y1, x2, y2, label, color):
     cv2.rectangle(frame, (x1, bg_y1), (x1 + text_w + pad * 2, bg_y2), color, -1)
     cv2.putText(frame, label, (x1 + pad, txt_y), font, 0.6, (255, 255, 255), 2)
 
+
 def _draw_segmentation(frame, result, class_name, color):
     # YOLO segmentation masks
     if result.masks is not None and result.masks.data is not None:
         masks = result.masks.data.cpu().numpy()
         for mask in masks:
-            # Resize mask to frame shape
             mask_resized = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
             colored_mask = np.zeros_like(frame)
             colored_mask[mask_resized > 0.5] = color
-            # Alpha blending
             cv2.addWeighted(colored_mask, 0.4, frame, 1.0, 0, frame)
-            
-    # Also draw boxes if available to show confidence
+
     if result.boxes is not None and len(result.boxes):
         boxes_xyxy = result.boxes.xyxy.cpu().numpy()
         confidences = result.boxes.conf.cpu().numpy()
@@ -190,6 +198,7 @@ def _draw_segmentation(frame, result, class_name, color):
             x1, y1, x2, y2 = map(int, box)
             label = f"{class_name} {conf*100:.0f}%"
             _draw_box_with_label(frame, x1, y1, x2, y2, label, color)
+
 
 def _draw_counter_overlay(frame, pothole_count, crack_count):
     overlay = frame.copy()
@@ -199,16 +208,30 @@ def _draw_counter_overlay(frame, pothole_count, crack_count):
     cv2.putText(frame, f"Pothole: {pothole_count}", (20, 40), font, 0.75, CLASS_COLORS["Pothole"], 2)
     cv2.putText(frame, f"Crack:   {crack_count}",   (20, 72), font, 0.75, CLASS_COLORS["Crack"], 2)
 
+
 def _reencode_to_h264(input_path, output_path):
     try:
-        r = subprocess.run(["ffmpeg", "-y", "-i", input_path, "-vcodec", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "fast", output_path], capture_output=True, timeout=300)
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path, "-vcodec", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "fast", output_path],
+            capture_output=True,
+            timeout=300
+        )
         return r.returncode == 0
-    except:
+    except Exception:
         return False
+
+
+def _cleanup_dir(path: str):
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "model_loaded": _model_loaded}
+
 
 @app.post("/predict/image")
 async def predict_image(file: UploadFile = File(...), model_type: str = Form("bbox")):
@@ -232,26 +255,30 @@ async def predict_image(file: UploadFile = File(...), model_type: str = Form("bb
         _draw_segmentation(frame, res_pothole, "Pothole", CLASS_COLORS["Pothole"])
         if res_pothole.boxes is not None:
             pothole_count += len(res_pothole.boxes)
-            
-        # Run Crack (Manual inference for Semantic Segmentation)
-        import torch
-        img_tensor = cv2.resize(frame_rgb, (640, 640))
-        img_tensor = img_tensor.transpose(2, 0, 1) # HWC to CHW
-        img_tensor = torch.from_numpy(img_tensor).float().div(255.0).unsqueeze(0).to(m_crack.device)
-        
-        with torch.no_grad():
-            out_crack = m_crack.model(img_tensor) # [1, 1, 80, 80]
-        
-        mask_crack = torch.sigmoid(out_crack[0, 0]).cpu().numpy()
-        mask_crack_resized = cv2.resize(mask_crack, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-        
-        colored_mask = np.zeros_like(frame)
-        colored_mask[mask_crack_resized > 0.5] = CLASS_COLORS["Crack"]
-        cv2.addWeighted(colored_mask, 0.4, frame, 1.0, 0, frame)
-        
-        if np.any(mask_crack_resized > 0.5):
-            crack_count += 1
 
+        # Run Crack (Semantic Segmentation)
+        img_tensor = cv2.resize(frame_rgb, (640, 640)).transpose(2, 0, 1)
+        device = getattr(m_crack, "device", next(m_crack.model.parameters()).device)
+        img_tensor = torch.from_numpy(img_tensor).float().div(255.0).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            out_crack = m_crack.model(img_tensor)
+
+        if isinstance(out_crack, (list, tuple)):
+            out_crack = out_crack[0]
+        mask_raw = out_crack[0, 0] if out_crack.ndim == 4 else (out_crack[0] if out_crack.ndim == 3 else out_crack)
+        mask_crack = torch.sigmoid(mask_raw).cpu().numpy()
+        mask_crack_resized = cv2.resize(mask_crack, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        binary_crack = (mask_crack_resized > 0.5).astype(np.uint8)
+        colored_mask = np.zeros_like(frame)
+        colored_mask[binary_crack == 1] = CLASS_COLORS["Crack"]
+        cv2.addWeighted(colored_mask, 0.4, frame, 1.0, 0, frame)
+
+        # Count individual crack regions using connected components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_crack)
+        valid_cracks = [i for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] >= 150]
+        crack_count += len(valid_cracks)
 
     else:
         # BBox
@@ -262,9 +289,11 @@ async def predict_image(file: UploadFile = File(...), model_type: str = Form("bb
                 cls_int = int(cls)
                 class_name = BBOX_CLASS_NAMES.get(cls_int, f"Class {cls_int}")
                 x1, y1, x2, y2 = map(int, box)
-                _draw_box_with_label(frame, x1, y1, x2, y2, f"{class_name} {conf*100:.0f}%", CLASS_COLORS.get(class_name, (200,200,200)))
-                if class_name == "Pothole": pothole_count += 1
-                elif class_name == "Crack": crack_count += 1
+                _draw_box_with_label(frame, x1, y1, x2, y2, f"{class_name} {conf*100:.0f}%", CLASS_COLORS.get(class_name, (200, 200, 200)))
+                if class_name == "Pothole":
+                    pothole_count += 1
+                elif class_name == "Crack":
+                    crack_count += 1
 
     success, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
     image_b64 = base64.b64encode(encoded.tobytes()).decode("utf-8")
@@ -273,8 +302,9 @@ async def predict_image(file: UploadFile = File(...), model_type: str = Form("bb
         "image_base64": image_b64,
         "pothole_count": pothole_count,
         "crack_count": crack_count,
-        "detections": detections, # optional detailed array
+        "detections": detections,
     })
+
 
 @app.post("/predict/video")
 async def predict_video(file: UploadFile = File(...), model_type: str = Form("bbox")):
@@ -299,64 +329,132 @@ async def predict_video(file: UploadFile = File(...), model_type: str = Form("bb
 
     seen_potholes = set()
     seen_cracks = set()
+    max_concurrent_cracks = 0
+    total_crack_frames = 0
     frame_count = 0
     t0 = time.time()
 
+    if model_type == "segmentation":
+        m_pothole, m_crack = _get_seg_models()
+        crack_device = getattr(m_crack, "device", next(m_crack.model.parameters()).device)
+    else:
+        bbox_model = _get_bbox_model()
+
     while True:
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            break
         frame_count += 1
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         if model_type == "segmentation":
-            m_pothole, m_crack = _get_seg_models()
-            res_pothole = m_pothole.predict(frame_rgb, conf=CONF_THRESHOLD, imgsz=640, verbose=False)[0]
-            _draw_segmentation(frame, res_pothole, "Pothole", CLASS_COLORS["Pothole"])
-            
-            import torch
-            img_tensor = cv2.resize(frame_rgb, (640, 640))
-            img_tensor = img_tensor.transpose(2, 0, 1) # HWC to CHW
-            img_tensor = torch.from_numpy(img_tensor).float().div(255.0).unsqueeze(0).to(m_crack.device)
-            
+            # Track potholes with segmentation
+            results_pot = m_pothole.track(frame_rgb, persist=True, conf=CONF_THRESHOLD, imgsz=640, tracker="bytetrack.yaml", verbose=False)
+            res_pothole = results_pot[0]
+
+            # Render pothole masks
+            if res_pothole.masks is not None and res_pothole.masks.data is not None:
+                masks = res_pothole.masks.data.cpu().numpy()
+                for mask in masks:
+                    mask_resized = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                    colored_mask = np.zeros_like(frame)
+                    colored_mask[mask_resized > 0.5] = CLASS_COLORS["Pothole"]
+                    cv2.addWeighted(colored_mask, 0.4, frame, 1.0, 0, frame)
+
+            # Draw boxes with track IDs
+            if res_pothole.boxes is not None and res_pothole.boxes.id is not None:
+                for box, tid, conf in zip(res_pothole.boxes.xyxy.cpu().numpy(), res_pothole.boxes.id.cpu().numpy(), res_pothole.boxes.conf.cpu().numpy()):
+                    tid_int = int(tid)
+                    seen_potholes.add(tid_int)
+                    x1, y1, x2, y2 = map(int, box)
+                    _draw_box_with_label(frame, x1, y1, x2, y2, f"Pothole #{tid_int} {conf*100:.0f}%", CLASS_COLORS["Pothole"])
+            elif res_pothole.boxes is not None and len(res_pothole.boxes):
+                for box, conf in zip(res_pothole.boxes.xyxy.cpu().numpy(), res_pothole.boxes.conf.cpu().numpy()):
+                    x1, y1, x2, y2 = map(int, box)
+                    _draw_box_with_label(frame, x1, y1, x2, y2, f"Pothole {conf*100:.0f}%", CLASS_COLORS["Pothole"])
+
+            # Crack semantic segmentation
+            img_tensor = cv2.resize(frame_rgb, (640, 640)).transpose(2, 0, 1)
+            img_tensor = torch.from_numpy(img_tensor).float().div(255.0).unsqueeze(0).to(crack_device)
+
             with torch.no_grad():
                 out_crack = m_crack.model(img_tensor)
-            
-            mask_crack = torch.sigmoid(out_crack[0, 0]).cpu().numpy()
+
+            if isinstance(out_crack, (list, tuple)):
+                out_crack = out_crack[0]
+            mask_raw = out_crack[0, 0] if out_crack.ndim == 4 else (out_crack[0] if out_crack.ndim == 3 else out_crack)
+            mask_crack = torch.sigmoid(mask_raw).cpu().numpy()
             mask_crack_resized = cv2.resize(mask_crack, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-            
+
+            binary_crack = (mask_crack_resized > 0.5).astype(np.uint8)
             colored_mask = np.zeros_like(frame)
-            colored_mask[mask_crack_resized > 0.5] = CLASS_COLORS["Crack"]
+            colored_mask[binary_crack == 1] = CLASS_COLORS["Crack"]
             cv2.addWeighted(colored_mask, 0.4, frame, 1.0, 0, frame)
-            
-            # Since tracking with 2 models is complex, we just sum per-frame counts for visual (not unique)
-            # but we can fake tracking by just incrementing by the max seen in a frame.
-            pass
+
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_crack)
+            active_cracks = sum(1 for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] >= 150)
+            if active_cracks > 0:
+                max_concurrent_cracks = max(max_concurrent_cracks, active_cracks)
+                total_crack_frames += 1
+
+            p_count = len(seen_potholes)
+            c_count = max_concurrent_cracks if max_concurrent_cracks > 0 else (1 if total_crack_frames > 0 else 0)
+
         else:
-            model = _get_bbox_model()
-            results = model.track(frame_rgb, persist=True, conf=CONF_THRESHOLD, imgsz=640, tracker="bytetrack.yaml", verbose=False)
+            results = bbox_model.track(frame_rgb, persist=True, conf=CONF_THRESHOLD, imgsz=640, tracker="bytetrack.yaml", verbose=False)
             res = results[0]
             if res.boxes is not None and res.boxes.id is not None:
                 for box, cls, conf, tid in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.cls.cpu().numpy(), res.boxes.conf.cpu().numpy(), res.boxes.id.cpu().numpy()):
                     cls_int = int(cls)
                     tid_int = int(tid)
                     cname = BBOX_CLASS_NAMES.get(cls_int, f"Class {cls_int}")
-                    if cname == "Pothole": seen_potholes.add(tid_int)
-                    elif cname == "Crack": seen_cracks.add(tid_int)
-                    x1,y1,x2,y2 = map(int, box)
-                    _draw_box_with_label(frame, x1, y1, x2, y2, f"{cname} #{tid_int} {conf*100:.0f}%", CLASS_COLORS.get(cname, (200,200,200)))
-        
-        # Draw counts overlay
-        p_count = len(seen_potholes) if model_type == "bbox" else 0
-        c_count = len(seen_cracks) if model_type == "bbox" else 0
+                    if cname == "Pothole":
+                        seen_potholes.add(tid_int)
+                    elif cname == "Crack":
+                        seen_cracks.add(tid_int)
+                    x1, y1, x2, y2 = map(int, box)
+                    _draw_box_with_label(frame, x1, y1, x2, y2, f"{cname} #{tid_int} {conf*100:.0f}%", CLASS_COLORS.get(cname, (200, 200, 200)))
+
+            p_count = len(seen_potholes)
+            c_count = len(seen_cracks)
+
         _draw_counter_overlay(frame, p_count, c_count)
         writer.write(frame)
 
     cap.release()
     writer.release()
     elapsed = time.time() - t0
-    
+
     h264_ok = _reencode_to_h264(raw_path, final_path)
     serve_path = final_path if h264_ok else raw_path
-    
-    summary_str = f"frames_processed={frame_count},video_duration_seconds={round(frame_count/fps, 2)}"
-    return FileResponse(serve_path, media_type="video/mp4", filename="annotated.mp4", headers={"X-Detection-Summary": summary_str, "Access-Control-Expose-Headers": "X-Detection-Summary"})
+
+    # Clean up intermediate raw file if h264 succeeded to save disk
+    if h264_ok and os.path.exists(raw_path):
+        try:
+            os.remove(raw_path)
+        except Exception:
+            pass
+
+    if os.path.exists(input_path):
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+
+    summary_str = (
+        f"frames_processed={frame_count},"
+        f"video_duration_seconds={round(frame_count/fps, 2)},"
+        f"unique_pothole_count={p_count},"
+        f"unique_crack_count={c_count}"
+    )
+
+    return FileResponse(
+        serve_path,
+        media_type="video/mp4",
+        filename="annotated.mp4",
+        headers={
+            "X-Detection-Summary": summary_str,
+            "Access-Control-Expose-Headers": "X-Detection-Summary"
+        },
+        background=BackgroundTask(_cleanup_dir, tmp_dir)
+    )

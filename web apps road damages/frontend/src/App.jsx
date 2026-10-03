@@ -1,4 +1,4 @@
-﻿import { useState, useCallback } from "react"
+import { useState, useCallback, useEffect, useRef } from "react"
 import Header from "./components/Header"
 import UploadSection from "./components/UploadSection"
 import ResultsSection from "./components/ResultsSection"
@@ -17,17 +17,39 @@ export default function App() {
   const [results, setResults] = useState(null)
   const [errorMsg, setErrorMsg] = useState("")
 
+  const previewRef = useRef(null)
+  const videoUrlRef = useRef(null)
+
+  // Clean up object URLs to avoid memory leaks
+  const cleanupUrls = useCallback(() => {
+    if (previewRef.current) {
+      URL.revokeObjectURL(previewRef.current)
+      previewRef.current = null
+    }
+    if (videoUrlRef.current) {
+      URL.revokeObjectURL(videoUrlRef.current)
+      videoUrlRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => cleanupUrls()
+  }, [cleanupUrls])
+
   const handleFileSelect = useCallback((selectedFile) => {
+    cleanupUrls()
     setFile(selectedFile)
     setResults(null)
     setErrorMsg("")
     setAppState("idle")
     if (selectedFile) {
-      setPreview(URL.createObjectURL(selectedFile))
+      const url = URL.createObjectURL(selectedFile)
+      previewRef.current = url
+      setPreview(url)
     } else {
       setPreview(null)
     }
-  }, [])
+  }, [cleanupUrls])
 
   const handleAnalyze = useCallback(async () => {
     if (!file) return
@@ -37,7 +59,7 @@ export default function App() {
 
     const formData = new FormData()
     formData.append("file", file)
-    formData.append("model_type", modelType) // Send model type to backend
+    formData.append("model_type", modelType)
 
     try {
       if (fileType === "image") {
@@ -63,6 +85,7 @@ export default function App() {
         })
         const blob = await res.blob()
         const videoUrl = URL.createObjectURL(blob)
+        videoUrlRef.current = videoUrl
         setResults({ type: "video", videoUrl, ...summary })
         setAppState("results")
       }
@@ -73,12 +96,13 @@ export default function App() {
   }, [file, fileType, modelType])
 
   const handleReset = useCallback(() => {
+    cleanupUrls()
     setFile(null)
     setPreview(null)
     setResults(null)
     setErrorMsg("")
     setAppState("idle")
-  }, [])
+  }, [cleanupUrls])
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "var(--color-bg-base)" }}>
@@ -111,7 +135,7 @@ export default function App() {
                   <input type="radio" name="modelType" checked={modelType === 'bbox'} onChange={() => setModelType('bbox')} className="mt-1" />
                   <div>
                     <p className="text-sm font-semibold" style={{ color: "var(--color-text-primary)" }}>Bounding Box</p>
-                    <p className="text-xs mt-1" style={{ color: "var(--color-text-muted)" }}>YOLOv8 Fast Inference. mAP50=81</p>
+                    <p className="text-xs mt-1" style={{ color: "var(--color-text-muted)" }}>YOLOv8 Fast Inference · mAP50=81%</p>
                   </div>
                 </label>
                 
